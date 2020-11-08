@@ -509,6 +509,7 @@ class Archiver:
                     skip_inodes.add((st.st_ino, st.st_dev))
                 except OSError:
                     pass
+            paths_from_stdin = args.paths_from_stdin or args.paths_from_stdin_delimiter is not None
             logger.debug('Processing files ...')
             if args.content_from_command:
                 path = args.stdin_name
@@ -536,6 +537,8 @@ class Archiver:
             else:
                 for path in args.paths:
                     if path == '-':  # stdin
+                        if paths_from_stdin:
+                            self.print_warning('Passing ``-`` as PATH is incompatible with ``--paths-from-stdin``, ignoring.')
                         path = args.stdin_name
                         mode = args.stdin_mode
                         user = args.stdin_user
@@ -570,6 +573,39 @@ class Archiver:
                                        exclude_caches=args.exclude_caches, exclude_if_present=args.exclude_if_present,
                                        keep_exclude_tags=args.keep_exclude_tags, skip_inodes=skip_inodes,
                                        restrict_dev=restrict_dev, read_special=args.read_special, dry_run=dry_run)
+            if paths_from_stdin:
+                if args.paths_from_stdin_delimiter is not None:
+                    # best hack to evaluate escape sequences in (unicode) strings
+                    sep = args.paths_from_stdin_delimiter.encode('latin-1').decode('unicode-escape')
+                else:
+                    sep = '\n'
+
+                def iter_separated():
+                    part = ''
+                    buf = sys.stdin.read(1024)
+                    while len(buf) > 0:
+                        cont, *xs = buf.split(sep)
+                        *xs2, part = (part + cont, *xs)
+                        yield from xs2
+                        buf = sys.stdin.read(1024)
+                    # check if stdin wasn't empty or finished with `sep`
+                    if len(part) > 0:
+                        yield part
+
+                for path in iter_separated():
+                    try:
+                        with backup_io('stat'):
+                            st = os_stat(path=path, parent_fd=None, name=None, follow_symlinks=False)
+                        status = self._process_any(path=path, parent_fd=None, name=None, st=st, fso=fso,
+                                                   cache=cache, read_special=args.read_special, dry_run=dry_run)
+                    except (BackupOSError, BackupError) as e:
+                        self.print_warning('%s: %s', path, e)
+                        status = 'E'
+                    if status == 'C':
+                        self.print_warning('%s: file changed while we backed it up', path)
+                    if status is None:
+                        status = '?'
+                    self.print_file_status(status, path)
             if not dry_run:
                 if args.progress:
                     archive.stats.show_progress(final=True)
@@ -3245,6 +3281,11 @@ class Archiver:
         subparser.add_argument('--content-from-command', action='store_true',
                                help='interpret PATH as command and store its stdout. See also section Reading from'
                                     ' stdin below.')
+        subparser.add_argument('--paths-from-stdin', action='store_true',
+                               help='read DELIM-separated list of paths to backup from stdin. Will not '
+                                    'recurse in directories')
+        subparser.add_argument('--paths-from-stdin-delimiter', metavar='DELIM',
+                               help='set path delimiter (default: \\n). Implies ``--paths-from-stdin``.')
 
         exclude_group = define_exclusion_group(subparser, tag_files=True)
         exclude_group.add_argument('--exclude-nodump', dest='exclude_nodump', action='store_true',
